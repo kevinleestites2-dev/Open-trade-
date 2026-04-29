@@ -2851,7 +2851,7 @@ class ZeusPrimeBot:
         self.telegram = TelegramBot(self.config)
 
         # Autonomy engine
-        self.engine = AutonomyEngine(
+        self.engine = MetaAutonomyEngine(
             self.config, self.client, self.ws,
             self.risk_mgr, self.db, self.telegram
         )

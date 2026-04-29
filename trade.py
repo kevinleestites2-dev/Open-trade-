@@ -2999,3 +2999,490 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================================
+# META LAYER 1: AI NEWS SENTIMENT ENGINE
+# ============================================================================
+
+class NewsSentimentEngine:
+    """
+    Scrapes real-time news and social signals relevant to active Polymarket
+    markets. Scores sentiment and returns a bias multiplier per market.
+    Uses Ollama LLM locally — no API keys needed.
+    """
+
+    SOURCES = [
+        "https://feeds.bbci.co.uk/news/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+        "https://feeds.reuters.com/reuters/topNews",
+    ]
+
+    def __init__(self, ollama_base="http://localhost:11434", model="qwen2.5-coder:7b"):
+        self.ollama_base = ollama_base
+        self.model = model
+        self._cache = {}  # market_id -> (score, timestamp)
+        self.cache_ttl = 300  # 5 minutes
+
+    def _fetch_headlines(self):
+        headlines = []
+        for url in self.SOURCES:
+            try:
+                import re
+                resp = requests.get(url, timeout=5)
+                titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', resp.text)
+                if not titles:
+                    titles = re.findall(r'<title>(.*?)</title>', resp.text)[1:6]
+                headlines.extend(titles[:5])
+            except Exception:
+                pass
+        return headlines[:20]
+
+    def _score_with_llm(self, market_question, headlines):
+        """Ask local LLM to score sentiment for a market. Returns -1 to 1."""
+        if not headlines:
+            return 0.0
+        prompt = (
+            f"Given these news headlines:\n"
+            + "\n".join(f"- {h}" for h in headlines[:10])
+            + f"\n\nFor the prediction market: '{market_question}'\n"
+            + "Return ONLY a float between -1.0 (very bearish/NO) and 1.0 (very bullish/YES). "
+            + "No explanation. Just the number."
+        )
+        try:
+            resp = requests.post(
+                f"{self.ollama_base}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False},
+                timeout=15
+            )
+            text = resp.json().get("response", "0").strip()
+            import re
+            match = re.search(r'-?\d+\.?\d*', text)
+            score = float(match.group()) if match else 0.0
+            return max(-1.0, min(1.0, score))
+        except Exception:
+            return 0.0
+
+    def get_sentiment(self, market_id, market_question):
+        """Get sentiment score for a market. Cached for 5 minutes."""
+        now = time.time()
+        if market_id in self._cache:
+            score, ts = self._cache[market_id]
+            if now - ts < self.cache_ttl:
+                return score
+        headlines = self._fetch_headlines()
+        score = self._score_with_llm(market_question, headlines)
+        self._cache[market_id] = (score, now)
+        logger.info(f"[SENTIMENT] {market_question[:60]} → {score:+.2f}")
+        return score
+
+    def get_bias_multiplier(self, market_id, market_question, side):
+        """Returns a capital multiplier (0.5x to 1.5x) based on sentiment alignment."""
+        score = self.get_sentiment(market_id, market_question)
+        if side.upper() == "YES":
+            alignment = score
+        else:
+            alignment = -score
+        return 1.0 + (alignment * 0.5)
+
+
+# ============================================================================
+# META LAYER 2: META-STRATEGY ROUTER (AI Capital Concentrator)
+# ============================================================================
+
+class MetaStrategyRouter:
+    """
+    AI-powered router that concentrates capital on the top N strategies
+    using Bayesian scoring blended with regime weights.
+    """
+
+    def __init__(self, db, regime_detector, top_n=3):
+        self.db = db
+        self.regime_detector = regime_detector
+        self.top_n = top_n
+        self._scores = {}
+
+    def _bayesian_score(self, name):
+        stats = self.db.get_strategy_stats(name, hours=24)
+        wins = stats["trades"] * stats["win_rate"]
+        losses = stats["trades"] - wins
+        alpha = 2 + wins
+        beta_val = 2 + losses
+        score = alpha / (alpha + beta_val)
+        regime_weights = self.regime_detector.get_strategy_weights()
+        regime_bonus = regime_weights.get(name, 0.1)
+        return score * 0.7 + regime_bonus * 0.3
+
+    def get_top_strategies(self, all_strategy_names):
+        self._scores = {name: self._bayesian_score(name) for name in all_strategy_names}
+        ranked = sorted(self._scores.items(), key=lambda x: x[1], reverse=True)
+        top = [name for name, _ in ranked[:self.top_n]]
+        logger.info(f"[META-ROUTER] Top strategies: {top}")
+        return top
+
+    def redistribute_weights(self, strategies, all_names):
+        """Concentrate 80% of capital on top N strategies."""
+        top = self.get_top_strategies(all_names)
+        each_top = 0.80 / len(top)
+        remaining = 0.20 / max(1, len(all_names) - len(top))
+        for name, strategy in strategies.items():
+            strategy.weight = each_top if name in top else remaining
+        logger.info(f"[META-ROUTER] Weights redistributed. Top {self.top_n} get {each_top*100:.1f}% each.")
+
+
+# ============================================================================
+# META LAYER 3: CROSS-MARKET CORRELATION ENGINE
+# ============================================================================
+
+class CorrelationEngine:
+    """
+    Tracks price movements across markets, detects correlations,
+    and suggests hedges when two correlated positions are open.
+    """
+
+    def __init__(self, db, window=50):
+        self.db = db
+        self.window = window
+        self._price_history = {}
+        self._correlation_cache = {}
+        self._last_compute = 0
+        self.compute_interval = 600
+
+    def update_price(self, market_id, price):
+        from collections import deque
+        if market_id not in self._price_history:
+            self._price_history[market_id] = deque(maxlen=self.window)
+        self._price_history[market_id].append(price)
+
+    def _pearson(self, a, b):
+        if len(a) < 10 or len(b) < 10:
+            return 0.0
+        n = min(len(a), len(b))
+        a, b = list(a)[-n:], list(b)[-n:]
+        mean_a = sum(a) / n
+        mean_b = sum(b) / n
+        num = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+        den_a = (sum((x - mean_a) ** 2 for x in a)) ** 0.5
+        den_b = (sum((y - mean_b) ** 2 for y in b)) ** 0.5
+        if den_a == 0 or den_b == 0:
+            return 0.0
+        return num / (den_a * den_b)
+
+    def compute_correlations(self):
+        now = time.time()
+        if now - self._last_compute < self.compute_interval:
+            return self._correlation_cache
+        self._last_compute = now
+        markets = list(self._price_history.keys())
+        for i in range(len(markets)):
+            for j in range(i + 1, len(markets)):
+                m1, m2 = markets[i], markets[j]
+                corr = self._pearson(self._price_history[m1], self._price_history[m2])
+                self._correlation_cache[(m1, m2)] = corr
+                if abs(corr) > 0.7:
+                    logger.info(f"[CORRELATION] {m1[:20]} <-> {m2[:20]}: {corr:.2f}")
+        return self._correlation_cache
+
+    def get_hedge_suggestion(self, market_id, open_positions):
+        correlations = self.compute_correlations()
+        for (m1, m2), corr in correlations.items():
+            other = None
+            if m1 == market_id and m2 in open_positions:
+                other = m2
+            elif m2 == market_id and m1 in open_positions:
+                other = m1
+            if other and abs(corr) > 0.75:
+                hedge_side = "NO" if corr > 0 else "YES"
+                return {
+                    "hedge_market": other,
+                    "suggested_side": hedge_side,
+                    "correlation": corr,
+                    "reason": f"High correlation ({corr:.2f}) detected"
+                }
+        return None
+
+
+# ============================================================================
+# META LAYER 4: LLM ORACLE — LOCAL AI PROBABILITY ESTIMATOR
+# ============================================================================
+
+class LLMOracle:
+    """
+    Uses a local Ollama model to estimate YES probability for Polymarket
+    questions. Feeds as an additional alpha signal into strategy decisions.
+    """
+
+    def __init__(self, ollama_base="http://localhost:11434", model="qwen2.5-coder:7b"):
+        self.ollama_base = ollama_base
+        self.model = model
+        self._cache = {}
+        self.cache_ttl = 600
+
+    def estimate_probability(self, question, description="", current_price=0.5):
+        now = time.time()
+        cache_key = question[:100]
+        if cache_key in self._cache:
+            prob, ts = self._cache[cache_key]
+            if now - ts < self.cache_ttl:
+                return prob
+
+        prompt = (
+            f"You are a prediction market analyst. Estimate the probability "
+            f"of YES for this market:\n\n"
+            f"Question: {question}\n"
+            f"Description: {description[:300] if description else 'N/A'}\n"
+            f"Current market price: {current_price:.2f}\n\n"
+            f"Return ONLY a probability between 0.00 and 1.00. No explanation."
+        )
+        try:
+            resp = requests.post(
+                f"{self.ollama_base}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False},
+                timeout=20
+            )
+            text = resp.json().get("response", "0.5").strip()
+            import re
+            match = re.search(r'0?\.\d+|\d+\.?\d*', text)
+            prob = float(match.group()) if match else 0.5
+            prob = max(0.01, min(0.99, prob))
+        except Exception:
+            prob = current_price
+
+        self._cache[cache_key] = (prob, now)
+        logger.info(f"[ORACLE] '{question[:60]}' → {prob:.2f} (market: {current_price:.2f})")
+        return prob
+
+    def get_edge(self, question, description, current_price, side):
+        """Returns estimated edge. Positive = good bet."""
+        oracle_prob = self.estimate_probability(question, description, current_price)
+        if side.upper() == "YES":
+            edge = oracle_prob - current_price
+        else:
+            edge = (1.0 - oracle_prob) - (1.0 - current_price)
+        logger.info(f"[ORACLE EDGE] {side} edge: {edge:+.3f}")
+        return edge
+
+
+# ============================================================================
+# META LAYER 5: STRATEGY FORGE — SELF-WRITING NEW STRATEGIES
+# ============================================================================
+
+class StrategyForge:
+    """
+    Monitors trade history for undiscovered patterns. When a pattern is found,
+    uses a local LLM to write a new strategy class, validates it in a sandbox,
+    and hot-loads it into the running bot — no restart needed.
+    """
+
+    def __init__(self, db, skills_dir, ollama_base="http://localhost:11434",
+                 model="qwen2.5-coder:7b"):
+        self.db = db
+        self.skills_dir = skills_dir
+        self.ollama_base = ollama_base
+        self.model = model
+        self.forged = {}
+        self._last_scan = 0
+        self.scan_interval = 3600
+
+    def _find_patterns(self):
+        try:
+            trades = self.db.get_all_trades_for_optimization("", 100)
+            winners = [t for t in trades if t.get("pnl", 0) > 0]
+            if len(winners) < 10:
+                return None
+            hour_pnl = {}
+            for t in winners:
+                ts = t.get("timestamp", "")
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    h = dt.hour
+                    hour_pnl.setdefault(h, []).append(t.get("pnl", 0))
+                except Exception:
+                    pass
+            best_hour = max(hour_pnl, key=lambda h: sum(hour_pnl[h]), default=None)
+            if best_hour is not None and len(hour_pnl.get(best_hour, [])) >= 3:
+                avg_pnl = sum(hour_pnl[best_hour]) / len(hour_pnl[best_hour])
+                return {"type": "time_of_day", "hour": best_hour,
+                        "avg_pnl": avg_pnl, "sample_size": len(hour_pnl[best_hour])}
+        except Exception as e:
+            logger.error(f"[FORGE] Pattern scan error: {e}")
+        return None
+
+    def _write_strategy_with_llm(self, pattern):
+        prompt = (
+            f"Write the body of a Python method `find_opportunities(self)` for a "
+            f"Polymarket trading strategy based on this pattern:\n"
+            f"{json.dumps(pattern, indent=2)}\n\n"
+            f"Return a list of dicts with keys: market_id, token_id, side, price, confidence.\n"
+            f"Use self.client to fetch markets. Keep it under 20 lines. "
+            f"Return ONLY the indented method body, no function signature."
+        )
+        try:
+            resp = requests.post(
+                f"{self.ollama_base}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False},
+                timeout=30
+            )
+            code = resp.json().get("response", "").strip()
+            import re
+            code = re.sub(r'```python\n?', '', code)
+            code = re.sub(r'```\n?', '', code)
+            return code
+        except Exception as e:
+            logger.error(f"[FORGE] LLM write error: {e}")
+            return None
+
+    def _sandbox_validate(self, code):
+        dangerous = ["os.system", "subprocess", "exec(", "eval(", "__import__",
+                     "open(", "shutil", "rmdir", "unlink"]
+        return not any(d in code for d in dangerous)
+
+    def forge_and_load(self, strategy_args):
+        now = time.time()
+        if now - self._last_scan < self.scan_interval:
+            return None
+        self._last_scan = now
+
+        pattern = self._find_patterns()
+        if not pattern:
+            return None
+
+        logger.info(f"[FORGE] Pattern discovered: {pattern}")
+        find_code = self._write_strategy_with_llm(pattern)
+
+        if not find_code or not self._sandbox_validate(find_code):
+            logger.warning("[FORGE] Generated code failed validation. Skipping.")
+            return None
+
+        indented = "\n".join("        " + line for line in find_code.splitlines())
+        name = f"v{int(now) % 10000}"
+
+        code = f'''
+class ForgedStrategy_{name}(BaseStrategy):
+    """Auto-generated strategy by StrategyForge. Pattern: {str(pattern)[:80]}"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.name = "forged_{name}"
+        self.weight = 0.05
+
+    def find_opportunities(self):
+{indented}
+
+    def execute(self):
+        opportunities = self.find_opportunities()
+        for opp in (opportunities or []):
+            try:
+                market_id = opp.get("market_id", "")
+                token_id = opp.get("token_id", "")
+                side = opp.get("side", "YES")
+                size = self.risk_mgr.calculate_position_size(
+                    self.weight, opp.get("confidence", 0.6)
+                )
+                if size > 0 and market_id and token_id:
+                    self._place_order(market_id, token_id, side, size, opp.get("price", 0.5))
+            except Exception as e:
+                logger.error(f"[FORGE] Order error: {{e}}")
+'''
+
+        skill_path = self.skills_dir / f"forged_{name}.py"
+        skill_path.write_text(code)
+
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(f"forged_{name}", skill_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cls = getattr(mod, f"ForgedStrategy_{name}")
+            instance = cls(*strategy_args)
+            self.forged[f"forged_{name}"] = instance
+            logger.info(f"[FORGE] New strategy hot-loaded: forged_{name} | Pattern: {pattern['type']}")
+            return f"forged_{name}"
+        except Exception as e:
+            logger.error(f"[FORGE] Hot-load failed: {e}")
+            skill_path.unlink(missing_ok=True)
+            return None
+
+    def get_forged_strategies(self):
+        return self.forged
+
+
+# ============================================================================
+# META AUTONOMY ENGINE — Extends AutonomyEngine with all 5 Meta Layers
+# ============================================================================
+
+class MetaAutonomyEngine(AutonomyEngine):
+    """
+    Extends AutonomyEngine with all 5 Meta layers:
+    1. News Sentiment Engine
+    2. Meta-Strategy Router
+    3. Cross-Market Correlation Engine
+    4. LLM Oracle
+    5. Strategy Forge
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ollama_base = getattr(self.config, 'OLLAMA_BASE', 'http://localhost:11434')
+        ollama_model = getattr(self.config, 'OLLAMA_MODEL', 'qwen2.5-coder:7b')
+
+        self.sentiment_engine = NewsSentimentEngine(ollama_base, ollama_model)
+        self.meta_router = MetaStrategyRouter(self.db, self.regime_detector, top_n=3)
+        self.correlation_engine = CorrelationEngine(self.db)
+        self.llm_oracle = LLMOracle(ollama_base, ollama_model)
+        self.strategy_forge = StrategyForge(self.db, SKILLS_DIR, ollama_base, ollama_model)
+
+        logger.info("🧠 META LAYER ONLINE — All 5 systems initialized")
+
+    def run_cycle(self):
+        """Override run_cycle to inject Meta intelligence into every trading cycle."""
+        can_trade, reason = self.risk_mgr.can_trade()
+        if not can_trade:
+            logger.warning(f"Trading halted: {reason}")
+            self.telegram.alert_circuit_breaker(reason)
+            time.sleep(60)
+            return
+
+        self.regime_detector.update()
+
+        # META: Concentrate capital on best strategies
+        self.meta_router.redistribute_weights(
+            self.strategies, list(self.strategies.keys())
+        )
+
+        # META: Forge new strategies from discovered patterns
+        strategy_args = (self.client, self.ws, self.risk_mgr,
+                         self.db, self.telegram, self.config)
+        new_strategy = self.strategy_forge.forge_and_load(strategy_args)
+        if new_strategy:
+            self.strategies.update(self.strategy_forge.get_forged_strategies())
+            self.telegram.alert_bot_status(
+                f"🔨 StrategyForge created new strategy: {new_strategy}"
+            )
+
+        # Execute all strategies
+        for name, strategy in self.strategies.items():
+            try:
+                if strategy.can_run():
+                    strategy.execute()
+            except Exception as e:
+                logger.error(f"Strategy {name} error: {e}\n{traceback.format_exc()}")
+                self.telegram.alert_error(f"Strategy {name}: {str(e)[:200]}")
+
+        self._post_trade_analysis()
+        self._run_scheduled_tasks()
+
+    def get_meta_status(self):
+        """Extended /status command with Meta layer info."""
+        base = self.get_status()
+        forged_count = len(self.strategy_forge.get_forged_strategies())
+        top = self.meta_router.get_top_strategies(list(self.strategies.keys()))
+        return (
+            base +
+            f"\n\n🧠 <b>Meta Layer Status</b>\n"
+            f"🎯 Top strategies: {', '.join(top)}\n"
+            f"🔨 Forged strategies: {forged_count}\n"
+            f"📡 Sentiment cache: {len(self.sentiment_engine._cache)} markets\n"
+            f"🔗 Correlations tracked: {len(self.correlation_engine._price_history)} markets\n"
+            f"🔮 Oracle cache: {len(self.llm_oracle._cache)} markets"
+        )

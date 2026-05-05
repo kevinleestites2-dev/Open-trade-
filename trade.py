@@ -2572,7 +2572,7 @@ class AutonomyEngine:
         self.last_daily_reset: Optional[datetime] = None
         self.last_daily_summary: Optional[datetime] = None
         self.last_weekly_report: Optional[datetime] = None
-        self.last_auto_update_check: Optional[datetime] = None
+        self.last_auto_update_check: Optional[datetime] = datetime.now(timezone.utc)  # Skip check on first boot
 
     def run_cycle(self):
         """Execute one full trading cycle."""

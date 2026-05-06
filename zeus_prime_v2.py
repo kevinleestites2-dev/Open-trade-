@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           ZEUS PRIME v2.0 — The Autonomous Trader            ║
+║           ZEUS PRIME v2.1 — The Autonomous Trader            ║
 ║           Built on py-clob-client (official SDK)             ║
 ║           All 10 strategies. Clean. Correct. Running.        ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -429,8 +429,7 @@ class DumpAndHedgeStrategy(Strategy):
         for asset in self.ASSETS:
             markets = self.client.get_markets(limit=10, tag=asset)
             for market in markets:
-                if "15" not in market.get("question", "").lower():
-                    continue
+                pass  # scan all markets (removed 15-min filter)
                 tokens = market.get("tokens", [])
                 if len(tokens) < 2:
                     continue
@@ -458,15 +457,15 @@ class DumpAndHedgeStrategy(Strategy):
                 yes_drop = (t["yes0"] - yes_p) / t["yes0"] if t["yes0"] else 0
                 no_drop  = (t["no0"]  - no_p)  / t["no0"]  if t["no0"]  else 0
 
-                if yes_drop >= 0.15:
+                if yes_drop >= 0.03:  # was 0.15
                     self.open_position(mid, yes_id, "BUY", yes_p, size * 0.3,
                                        take_profit_pct=0.05, stop_loss_pct=0.10)
                     del self.tracked[mid]
-                elif no_drop >= 0.15:
+                elif no_drop >= 0.03:  # was 0.15
                     self.open_position(mid, no_id, "BUY", no_p, size * 0.3,
                                        take_profit_pct=0.05, stop_loss_pct=0.10)
                     del self.tracked[mid]
-                elif yes_p + no_p <= 0.95:
+                elif yes_p + no_p <= 0.98:  # was 0.95
                     half = size * 0.2
                     self.open_position(mid, yes_id, "BUY", yes_p, half,
                                        take_profit_pct=0.05, stop_loss_pct=0.10)
@@ -484,7 +483,7 @@ class YesNoArbStrategy(Strategy):
     TP when sum normalizes. SL 5%.
     """
     NAME = "yes_no_arb"
-    MIN_DISCOUNT = 0.03
+    MIN_DISCOUNT = 0.005  # was 0.03
 
     def run(self):
         self.manage_positions()
@@ -643,7 +642,26 @@ class CopyTradingStrategy(Strategy):
     def run(self):
         self.manage_positions()
         if not any(cfg.COPY_WALLETS.values()):
-            return  # No wallets configured — skip silently
+            # Sim fallback: mirror top-volume markets
+            balance = self.client.get_balance()
+            size = self.risk.position_size(balance) * 0.4
+            markets = self.client.get_markets(limit=5)
+            for market in markets[:2]:
+                tokens = market.get("tokens", [])
+                if not tokens:
+                    continue
+                yes_id = tokens[0]["token_id"]
+                mid_id = market["condition_id"]
+                price = self.client.get_price(yes_id)
+                if not price or not (0.20 < price < 0.80):
+                    continue
+                already = any(p["market_id"] == mid_id for p in self.positions)
+                if already:
+                    continue
+                side = "BUY" if price < 0.50 else "SELL"
+                self.open_position(mid_id, yes_id, side, price, size,
+                                   take_profit_pct=0.05, stop_loss_pct=0.10)
+            return
 
         balance = self.client.get_balance()
         size = self.risk.position_size(balance) * 0.5
@@ -748,7 +766,7 @@ class FlashLoanArbStrategy(Strategy):
     flash loans. In simulate/current mode, executes as regular dual-buy arb.
     """
     NAME = "flash_loan_arb"
-    MIN_PROFIT_BPS = 10
+    MIN_PROFIT_BPS = 1  # was 10
     SCAN_INTERVAL = 5
 
     def __init__(self, *args, **kwargs):
@@ -801,8 +819,8 @@ class GrindTradingStrategy(Strategy):
     NAME = "grind_trading"
     MIN_PRICE = 0.15
     MAX_PRICE = 0.85
-    MIN_SPREAD = 0.008
-    MAX_SPREAD = 0.06
+    MIN_SPREAD = 0.003  # was 0.008
+    MAX_SPREAD = 0.10  # was 0.06
     MAX_POSITIONS = 3
     COOLDOWN = 15
 
@@ -832,7 +850,7 @@ class GrindTradingStrategy(Strategy):
             tokens = market.get("tokens", [])
             if not tokens:
                 continue
-            if market.get("volume", 0) < 100_000:
+            if market.get("volume", 0) < 10_000:  # was 100k
                 continue
 
             yes_id = tokens[0]["token_id"]
@@ -879,7 +897,7 @@ class DayTradingMomentumStrategy(Strategy):
     """
     NAME = "day_trading_momentum"
     TREND_WINDOW = 150   # seconds
-    MIN_MOVE = 0.03
+    MIN_MOVE = 0.01  # was 0.03
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -892,10 +910,7 @@ class DayTradingMomentumStrategy(Strategy):
         size = balance * 0.20
 
         for market in markets:
-            q = market.get("question", "").lower()
-            if "5 min" not in q and "15 min" not in q:
-                continue
-            tokens = market.get("tokens", [])
+            tokens = market.get("tokens", [])  # all markets
             if not tokens:
                 continue
             yes_id = tokens[0]["token_id"]
@@ -940,7 +955,7 @@ class MeanReversionStrategy(Strategy):
     Time-exit after 60 min. TP 2-4% | SL 10%.
     """
     NAME = "mean_reversion"
-    OVEREXTENSION = 0.08
+    OVEREXTENSION = 0.03  # was 0.08
     MAX_HOLD_SEC = 3600
     LOOKBACK_SEC = 600
 
@@ -984,7 +999,7 @@ class MeanReversionStrategy(Strategy):
 
             recent = [h["p"] for h in self.price_history[yes_id]
                       if time.time() - h["t"] <= self.LOOKBACK_SEC]
-            if len(recent) < 5:
+            if len(recent) < 3:  # was 5
                 continue
 
             mean = sum(recent) / len(recent)

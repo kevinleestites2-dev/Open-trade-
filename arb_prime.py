@@ -59,17 +59,17 @@ TOKENS = {
     "WETH":  "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619",
     "WBTC":  "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
     "USDC":  "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
-    "USDT":  "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+    "USDT0": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",  # USDT on Polygon (USDT0)
     "DAI":   "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
 }
 
 WATCH_PAIRS = [
-    ("WPOL",  "USDC"),
-    ("WETH",  "USDC"),
+    ("WPOL",  "USDT0"),
+    ("WETH",  "USDT0"),
     ("WBTC",  "USDC"),
     ("WPOL",  "WETH"),
-    ("WETH",  "USDT"),
-    ("DAI",   "USDC"),
+    ("WETH",  "DAI"),
+    ("DAI",   "USDT0"),
 ]
 
 
@@ -80,14 +80,20 @@ def get_pool_for_pair(dex_id: str, token_a: str, token_b: str) -> Optional[dict]
     addr_a = TOKENS[token_a].lower()
     addr_b = TOKENS[token_b].lower()
     url    = f"{DEXPAPRIKA_BASE}/networks/{NETWORK}/dexes/{dex_id}/pools"
-    params = {"limit": 200, "sort": "volume_usd", "order_by": "desc"}
+    # NOTE: do NOT pass limit/sort params — they break the API and return 0 pools
     try:
-        r = requests.get(url, params=params, timeout=12)
+        r = requests.get(url, timeout=12)
         r.raise_for_status()
+        best = None
+        best_vol = 0.0
         for pool in r.json().get("pools", []):
             ids = [t["id"].lower() for t in pool.get("tokens", [])]
             if addr_a in ids and addr_b in ids:
-                return pool
+                vol = pool.get("volume_usd", 0) or 0
+                if best is None or vol > best_vol:
+                    best = pool
+                    best_vol = vol
+        return best
     except Exception as e:
         log.debug(f"Pool fetch error ({dex_id}): {e}")
     return None

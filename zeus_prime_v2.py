@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           ZEUS PRIME v2.2 — The Autonomous Trader            ║
+║           ZEUS PRIME v2.3 — The Autonomous Trader            ║
 ║           Built on py-clob-client (official SDK)             ║
-║           11 strategies. AscetixMode ACTIVE.        ║
+║           11 strategies. AscetixMode ACTIVE.                 ║
+║           CROSS-PLATFORM: Polymarket + Kalshi                ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -33,6 +34,15 @@ from py_clob_client.clob_types import (
     AssetType,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
+
+# Cross-platform client
+try:
+    from kalshi_client import KalshiClient
+    _KALSHI_AVAILABLE = True
+except ImportError:
+    _KALSHI_AVAILABLE = False
+    log_stub = logging.getLogger("ZeusPrime")
+    log_stub.warning("kalshi_client.py not found — Kalshi disabled")
 
 # ============================================================================
 # BOOTSTRAP
@@ -77,6 +87,11 @@ class Config:
         "ColdMath":       os.getenv("COPY_WALLET_COLDMATH", "0x7760fe4dcb17c09161adb2eb8d29f39e382e21f0"), # cumulus33 20.6%
         "embarrassment":  os.getenv("COPY_WALLET_4", "0x5c3a1a602848565bb16165fcd460b00c3d43020b"),      # embarrassment 20.9%
     }
+
+    # Kalshi credentials
+    KALSHI_KEY_ID:     str   = os.getenv("KALSHI_API_KEY_ID", "")
+    KALSHI_KEY_PATH:   str   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+    KALSHI_ENABLED:    bool  = os.getenv("KALSHI_ENABLED", "false").lower() == "true"
 
     # Risk limits
     MAX_POSITION_PCT:  float = 0.05   # 5% per position
@@ -480,11 +495,95 @@ class DumpAndHedgeStrategy(Strategy):
 
 class YesNoArbStrategy(Strategy):
     """
-    YES + NO < 0.97 → buy both sides → guaranteed ~3% at resolution.
+    Mode A — Same-venue: YES + NO < 0.97 → buy both sides → guaranteed ~3% at resolution.
+    Mode B — Cross-venue: Same event priced differently on Poly vs Kalshi.
+             Buy YES on cheaper venue, buy NO on other → lock in spread.
     TP when sum normalizes. SL 5%.
     """
     NAME = "yes_no_arb"
-    MIN_DISCOUNT = 0.005  # was 0.03
+    MIN_DISCOUNT       = 0.005   # same-venue minimum gap
+    CROSS_MIN_SPREAD   = 0.03    # cross-venue: min 3¢ spread to fire
+    _last_cross_scan   = 0
+    CROSS_SCAN_INTERVAL = 120    # seconds between cross-venue scans
+
+    def __init__(self, client, risk):
+        super().__init__(client, risk)
+        # Kalshi client — only if enabled and available
+        self.kalshi: Optional["KalshiClient"] = None
+        if _KALSHI_AVAILABLE and cfg.KALSHI_ENABLED:
+            try:
+                self.kalshi = KalshiClient()
+                log.info("YesNoArb: Kalshi cross-venue arb ARMED ✅")
+            except Exception as e:
+                log.warning(f"YesNoArb: Kalshi init failed: {e}")
+
+    def _cross_venue_scan(self, size: float):
+        """
+        Scan Polymarket top markets → find matching Kalshi market →
+        compare YES prices → fire if spread >= CROSS_MIN_SPREAD.
+        """
+        if not self.kalshi:
+            return
+        now = time.time()
+        if now - self._last_cross_scan < self.CROSS_SCAN_INTERVAL:
+            return
+        YesNoArbStrategy._last_cross_scan = now
+
+        poly_markets = self.client.get_markets(limit=30)
+        for pm in poly_markets:
+            tokens = pm.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+            question = pm.get("question", "")
+            # Find matching Kalshi market
+            km = self.kalshi.find_matching_market(question, poly_markets)
+            if not km:
+                continue
+
+            # Get YES prices on both venues
+            poly_yes_id = tokens[0]["token_id"]
+            kals_yes_id = km["tokens"][0]["token_id"]
+
+            poly_yes = self.client.get_price(poly_yes_id)
+            kals_yes = self.kalshi.get_price(kals_yes_id)
+
+            if not poly_yes or not kals_yes:
+                continue
+
+            spread = abs(poly_yes - kals_yes)
+            if spread < self.CROSS_MIN_SPREAD:
+                continue
+
+            # Buy YES on cheaper venue, buy NO (= sell YES) on expensive venue
+            if poly_yes < kals_yes:
+                cheap_client, cheap_id = self.client,  poly_yes_id
+                dear_client,  dear_id  = self.kalshi,  kals_yes_id
+                cheap_p, dear_p = poly_yes, kals_yes
+                cheap_venue, dear_venue = "Poly", "Kalshi"
+            else:
+                cheap_client, cheap_id = self.kalshi,  kals_yes_id
+                dear_client,  dear_id  = self.client,  poly_yes_id
+                cheap_p, dear_p = kals_yes, poly_yes
+                cheap_venue, dear_venue = "Kalshi", "Poly"
+
+            # Buy YES on cheap venue
+            cheap_oid = cheap_client.place_order(cheap_id, "BUY", cheap_p, size)
+            # Buy NO on dear venue (NO token_id = token ending -NO)
+            no_id_dear = dear_id.rsplit("-", 1)[0] + "-NO" if dear_venue == "Kalshi" \
+                         else km["tokens"][1]["token_id"] if dear_venue == "Poly" \
+                         else pm["tokens"][1]["token_id"]
+            dear_oid  = dear_client.place_order(no_id_dear, "BUY", 1 - dear_p, size)
+
+            if cheap_oid or dear_oid:
+                tg(
+                    f"🌐 <b>Cross-Venue Arb FIRED</b>\n"
+                    f"📌 {question[:55]}\n"
+                    f"✅ YES on {cheap_venue}: {cheap_p:.3f}\n"
+                    f"❌ NO  on {dear_venue}: {1-dear_p:.3f}\n"
+                    f"💰 Spread: {spread:.2%} | Size: ${size:.2f}"
+                )
+                log.info(f"Cross-venue arb: {cheap_venue} YES@{cheap_p:.3f} vs "
+                         f"{dear_venue} NO@{1-dear_p:.3f} spread={spread:.2%}")
 
     def run(self):
         self.manage_positions()
@@ -493,6 +592,7 @@ class YesNoArbStrategy(Strategy):
             return
         size = self.risk.position_size(balance) / 2
 
+        # ── Mode A: same-venue YES+NO discount ──
         markets = self.client.get_markets(limit=30)
         for market in markets:
             tokens = market.get("tokens", [])
@@ -514,6 +614,9 @@ class YesNoArbStrategy(Strategy):
                 tg(f"⚡ <b>YES/NO Arb</b>\n"
                    f"Discount: {discount:.2%}\n"
                    f"{market['question'][:60]}")
+
+        # ── Mode B: cross-venue Poly ↔ Kalshi ──
+        self._cross_venue_scan(size)
 
 # ============================================================================
 # STRATEGY 3: YIELD FARMING (Market Making)
@@ -1310,12 +1413,23 @@ class ZeusPrimeV2:
     REPORT_EVERY = 30   # cycles (~30 min)
 
     def __init__(self):
-        log.info("═══ ZeusPrime v2.0 Initializing ═══")
+        log.info("═══ ZeusPrime v2.3 Initializing ═══")
         self.client = PolyClient()
         self.risk   = RiskManager(self.client)
+
+        # Kalshi client (optional — only if KALSHI_ENABLED=true in .env)
+        self.kalshi: Optional[KalshiClient] = None
+        if _KALSHI_AVAILABLE and cfg.KALSHI_ENABLED:
+            try:
+                self.kalshi = KalshiClient()
+                kbal = self.kalshi.get_balance()
+                log.info(f"Kalshi online ✅ Balance: ${kbal:.2f}")
+            except Exception as e:
+                log.warning(f"Kalshi init failed (continuing Poly-only): {e}")
+
         self.strategies = [
             DumpAndHedgeStrategy(self.client, self.risk),       # 1
-            YesNoArbStrategy(self.client, self.risk),           # 2
+            YesNoArbStrategy(self.client, self.risk),           # 2  ← cross-venue arb
             YieldFarmingStrategy(self.client, self.risk),       # 3
             MakerRebateMMStrategy(self.client, self.risk),      # 4
             CopyTradingStrategy(self.client, self.risk),        # 5
@@ -1324,19 +1438,21 @@ class ZeusPrimeV2:
             GrindTradingStrategy(self.client, self.risk),       # 8
             DayTradingMomentumStrategy(self.client, self.risk), # 9
             MeanReversionStrategy(self.client, self.risk),      # 10
-            AscetixModeStrategy(self.client, self.risk),         # 11 ★ MONEY ENGINE
+            AscetixModeStrategy(self.client, self.risk),        # 11 ★ MONEY ENGINE
         ]
         self.cycle = 0
         self.start_balance = self.client.get_balance()
-        mode = "🔴 LIVE" if not cfg.SIMULATE else "🟡 SIMULATE"
+        mode       = "🔴 LIVE" if not cfg.SIMULATE else "🟡 SIMULATE"
+        kalshi_tag = "✅ Kalshi ARMED" if self.kalshi else "⚪ Poly-only"
         tg(
-            f"⚡ <b>ZeusPrime v2.0 ONLINE</b>\n"
+            f"⚡ <b>ZeusPrime v2.3 ONLINE</b>\n"
             f"Mode: {mode}\n"
             f"Capital: ${self.start_balance:.2f} USDC\n"
             f"Strategies: {len(self.strategies)} active (AscetixMode ON)\n"
+            f"Cross-platform: {kalshi_tag}\n"
             f"Cycle: {self.CYCLE_SEC}s"
         )
-        log.info(f"ZeusPrime v2.2 ready. {len(self.strategies)} strategies loaded.")
+        log.info(f"ZeusPrime v2.3 ready. {len(self.strategies)} strategies. Kalshi={'ON' if self.kalshi else 'OFF'}")
 
     def report(self):
         balance = self.client.get_balance()

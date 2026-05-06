@@ -33,7 +33,7 @@ log = logging.getLogger("KalshiClient")
 # ─────────────────────────────────────────────
 # CONFIG  (reads from .env)
 # ─────────────────────────────────────────────
-KALSHI_API_BASE   = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_API_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_KEY_ID     = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_KEY_PATH   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
 KALSHI_KEY_PEM    = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")   # fallback inline PEM
@@ -83,12 +83,19 @@ class KalshiClient:
     # AUTH HEADER
     # ─────────────────────────────────────────
     def _sign(self, method: str, path: str) -> dict:
-        """Generate Kalshi RSA signature headers."""
+        """Generate Kalshi RSA-PSS signature headers.
+        Kalshi requires RSA-PSS with SHA256 (NOT PKCS1v15).
+        Timestamp must be milliseconds. Sign path WITHOUT query string.
+        """
         ts_ms = str(int(time.time() * 1000))
-        msg = ts_ms + method.upper() + path
+        path_no_query = path.split("?")[0]
+        msg = ts_ms + method.upper() + path_no_query
         signature = self._private_key.sign(
             msg.encode("utf-8"),
-            padding.PKCS1v15(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
             hashes.SHA256(),
         )
         sig_b64 = base64.b64encode(signature).decode()
@@ -103,7 +110,9 @@ class KalshiClient:
         if self._stub:
             return None
         try:
-            headers = self._sign("GET", path)
+            from urllib.parse import urlparse
+            full_path = urlparse(self.BASE + path).path   # strip host, keep /trade-api/v2/...
+            headers = self._sign("GET", full_path)
             resp = self._session.get(
                 self.BASE + path, headers=headers, params=params, timeout=10
             )
@@ -116,9 +125,10 @@ class KalshiClient:
     def _post(self, path: str, body: dict) -> Optional[dict]:
         if self._stub:
             return None
-        import json
         try:
-            headers = self._sign("POST", path)
+            from urllib.parse import urlparse
+            full_path = urlparse(self.BASE + path).path
+            headers = self._sign("POST", full_path)
             resp = self._session.post(
                 self.BASE + path, headers=headers, json=body, timeout=10
             )
@@ -132,7 +142,9 @@ class KalshiClient:
         if self._stub:
             return True
         try:
-            headers = self._sign("DELETE", path)
+            from urllib.parse import urlparse
+            full_path = urlparse(self.BASE + path).path
+            headers = self._sign("DELETE", full_path)
             resp = self._session.delete(self.BASE + path, headers=headers, timeout=10)
             resp.raise_for_status()
             return True

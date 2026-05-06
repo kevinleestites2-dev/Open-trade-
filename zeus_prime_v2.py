@@ -72,9 +72,10 @@ class Config:
 
     # Copy-trading wallets (populate to enable strategy 5)
     COPY_WALLETS: Dict[str, str] = {
-        "RN1":      os.getenv("COPY_WALLET_RN1", ""),
-        "Domer":    os.getenv("COPY_WALLET_DOMER", ""),
-        "ColdMath": os.getenv("COPY_WALLET_COLDMATH", ""),
+        "RN1":            os.getenv("COPY_WALLET_RN1", "0x04b954ec5d65e0a855d31b5e695083f3c4ad79e0"),   # immanuelcan 17.7%
+        "Domer":          os.getenv("COPY_WALLET_DOMER", "0xd202bf6d89dc6bab1b9f00ead175f75466348973"),  # meoooow 30.9%
+        "ColdMath":       os.getenv("COPY_WALLET_COLDMATH", "0x7760fe4dcb17c09161adb2eb8d29f39e382e21f0"), # cumulus33 20.6%
+        "embarrassment":  os.getenv("COPY_WALLET_4", "0x5c3a1a602848565bb16165fcd460b00c3d43020b"),      # embarrassment 20.9%
     }
 
     # Risk limits
@@ -861,7 +862,7 @@ class GrindTradingStrategy(Strategy):
 
             bids = book.get("bids", [])
             asks = book.get("asks", [])
-            if len(bids) < 3 or len(asks) < 3:
+            if len(bids) < 2 or len(asks) < 2:
                 continue
 
             best_bid = float(bids[0]["price"])

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           ZEUS PRIME v2.1 — The Autonomous Trader            ║
+║           ZEUS PRIME v2.2 — The Autonomous Trader            ║
 ║           Built on py-clob-client (official SDK)             ║
-║           All 10 strategies. Clean. Correct. Running.        ║
+║           11 strategies. AscetixMode ACTIVE.        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -1018,6 +1018,288 @@ class MeanReversionStrategy(Strategy):
                f"Dev: {dev:+.1%} | Mean: {mean:.4f}\n"
                f"{market['question'][:55]}")
 
+
+# ============================================================================
+# STRATEGY 11: ASCETIX MODE (BTC 15-min Directional)
+# ============================================================================
+
+class AscetixModeStrategy(Strategy):
+    """
+    Replicates the @ascetic0x method:
+    - Targets Polymarket BTC 15-min Up/Down markets
+    - 4-signal confluence: order book, funding rate, liquidation flow, momentum
+    - Enters directionally with 25% of capital
+    - TP 80%+ price (near $1.00) | SL if price drops 40% from entry
+    - Fires every cycle — this is the PRIMARY money engine
+    """
+    NAME = "ascetix_mode"
+    CAPITAL_PCT  = 0.25   # 25% of balance per trade — aggressive but controlled
+    TP_PRICE     = 0.82   # take profit when shares hit $0.82+
+    SL_DROP_PCT  = 0.40   # stop loss if price drops 40% from entry
+    BINANCE_URL  = "https://fapi.binance.com"
+    COINGLASS_URL = "https://open-api.coinglass.com/public/v2"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_signal_ts = 0
+        self._cooldown = 900  # 15 min between entries (one market window)
+
+    # ── External Data Fetchers ──────────────────────────────────────────
+
+    def _get_funding_rate(self) -> Optional[float]:
+        """Binance perpetual BTC funding rate. Positive = longs crowded."""
+        try:
+            url = f"{self.BINANCE_URL}/fapi/v1/premiumIndex?symbol=BTCUSDT"
+            r = requests.get(url, timeout=5)
+            data = r.json()
+            return float(data.get("lastFundingRate", 0))
+        except Exception as e:
+            log.warning(f"[Ascetix] funding rate: {e}")
+            return None
+
+    def _get_orderbook_bias(self) -> Optional[str]:
+        """
+        Binance BTC spot order book depth.
+        Returns 'UP' if strong bid wall, 'DOWN' if strong ask wall, None if neutral.
+        """
+        try:
+            url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=20"
+            r = requests.get(url, timeout=5)
+            book = r.json()
+            bids = sum(float(b[1]) for b in book.get("bids", []))
+            asks = sum(float(a[1]) for a in book.get("asks", []))
+            ratio = bids / asks if asks else 1.0
+            if ratio > 1.3:
+                return "UP"    # 30%+ more buy pressure
+            elif ratio < 0.7:
+                return "DOWN"  # 30%+ more sell pressure
+            return None
+        except Exception as e:
+            log.warning(f"[Ascetix] orderbook: {e}")
+            return None
+
+    def _get_liquidation_bias(self) -> Optional[str]:
+        """
+        Binance recent liquidation orders.
+        If big LONG liquidations just hit → downside pressure exhausted → UP
+        If big SHORT liquidations just hit → upside fuel gone → DOWN
+        """
+        try:
+            url = f"{self.BINANCE_URL}/fapi/v1/allForceOrders?symbol=BTCUSDT&limit=50"
+            r = requests.get(url, timeout=5)
+            orders = r.json()
+            long_liq  = sum(float(o["origQty"]) for o in orders if o.get("side") == "SELL")
+            short_liq = sum(float(o["origQty"]) for o in orders if o.get("side") == "BUY")
+            if long_liq > short_liq * 2:
+                return "UP"    # long liquidations dominated → bounce likely
+            elif short_liq > long_liq * 2:
+                return "DOWN"  # short squeeze done → pullback likely
+            return None
+        except Exception as e:
+            log.warning(f"[Ascetix] liquidations: {e}")
+            return None
+
+    def _get_btc_momentum(self) -> Optional[str]:
+        """
+        BTC 1-min klines — last 5 candles.
+        3+ green closes → UP momentum. 3+ red closes → DOWN momentum.
+        """
+        try:
+            url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=6"
+            r = requests.get(url, timeout=5)
+            klines = r.json()
+            closes = [(float(k[4]) - float(k[1])) for k in klines[-5:]]  # close - open
+            green = sum(1 for c in closes if c > 0)
+            red   = sum(1 for c in closes if c < 0)
+            if green >= 4:
+                return "UP"
+            elif red >= 4:
+                return "DOWN"
+            return None
+        except Exception as e:
+            log.warning(f"[Ascetix] momentum: {e}")
+            return None
+
+    # ── Signal Scoring ──────────────────────────────────────────────────
+
+    def _compute_signal(self) -> Optional[str]:
+        """
+        4-signal confluence. Need 3/4 agreement to fire.
+        Returns 'UP', 'DOWN', or None (no trade).
+        """
+        funding = self._get_funding_rate()
+        ob_bias = self._get_orderbook_bias()
+        liq_bias = self._get_liquidation_bias()
+        mom_bias = self._get_btc_momentum()
+
+        signals = {"UP": 0, "DOWN": 0}
+
+        # Funding: positive = longs crowded = DOWN signal
+        if funding is not None:
+            if funding > 0.0005:
+                signals["DOWN"] += 1
+                log.info(f"[Ascetix] Funding {funding:.4%} → DOWN signal")
+            elif funding < -0.0005:
+                signals["UP"] += 1
+                log.info(f"[Ascetix] Funding {funding:.4%} → UP signal")
+
+        # Order book bias
+        if ob_bias:
+            signals[ob_bias] += 1
+            log.info(f"[Ascetix] OrderBook → {ob_bias} signal")
+
+        # Liquidation bias
+        if liq_bias:
+            signals[liq_bias] += 1
+            log.info(f"[Ascetix] Liquidations → {liq_bias} signal")
+
+        # Momentum
+        if mom_bias:
+            signals[mom_bias] += 1
+            log.info(f"[Ascetix] Momentum → {mom_bias} signal")
+
+        log.info(f"[Ascetix] Score: UP={signals['UP']} DOWN={signals['DOWN']}")
+
+        if signals["UP"] >= 3:
+            return "UP"
+        elif signals["DOWN"] >= 3:
+            return "DOWN"
+        return None
+
+    # ── Market Finder ───────────────────────────────────────────────────
+
+    def _find_btc_15min_market(self, direction: str) -> Optional[dict]:
+        """Find the active BTC 15-min UP or DOWN market on Polymarket."""
+        try:
+            markets = self.client.get_markets(limit=50)
+            keyword = "bitcoin" if True else ""
+            for m in markets:
+                q = m.get("question", "").lower()
+                # Match BTC 15-min up/down style questions
+                if ("btc" in q or "bitcoin" in q) and ("15" in q or "minute" in q):
+                    tokens = m.get("tokens", [])
+                    if len(tokens) < 2:
+                        continue
+                    # token[0] = YES (Up), token[1] = NO (Down)
+                    if direction == "UP":
+                        return {"market": m, "token_id": tokens[0]["token_id"], "label": "YES/UP"}
+                    else:
+                        return {"market": m, "token_id": tokens[1]["token_id"], "label": "NO/DOWN"}
+            return None
+        except Exception as e:
+            log.error(f"[Ascetix] find market: {e}")
+            return None
+
+    # ── Position Manager ────────────────────────────────────────────────
+
+    def _manage_exits(self):
+        """TP at $0.82+, SL at 40% drop from entry."""
+        for pos in list(self.positions):
+            price = self.client.get_price(pos["token_id"])
+            if not price:
+                continue
+            entry = pos["entry"]
+            drop_pct = (entry - price) / entry if entry else 0
+            pnl = (price - entry) * pos["size"]
+
+            if price >= self.TP_PRICE:
+                oid = self.client.place_order(pos["token_id"], "SELL", price, pos["size"])
+                db.log_trade(self.NAME, pos["market_id"], pos["token_id"],
+                             "SELL", price, pos["size"], oid or "", "tp", pnl)
+                tg(f"🎯 <b>AscetixMode TP</b>\nEntry: ${entry:.4f} → Exit: ${price:.4f}\nPnL: ${pnl:+.2f} ({(price/entry - 1)*100:+.1f}%)")
+                self.positions.remove(pos)
+            elif drop_pct >= self.SL_DROP_PCT:
+                oid = self.client.place_order(pos["token_id"], "SELL", price, pos["size"])
+                db.log_trade(self.NAME, pos["market_id"], pos["token_id"],
+                             "SELL", price, pos["size"], oid or "", "sl", pnl)
+                tg(f"🛑 <b>AscetixMode SL</b>\nEntry: ${entry:.4f} → Exit: ${price:.4f}\nPnL: ${pnl:+.2f}")
+                self.positions.remove(pos)
+
+    # ── Main Run ────────────────────────────────────────────────────────
+
+    def run(self):
+        self._manage_exits()
+
+        # Cooldown: only enter once per 15-min window
+        if time.time() - self._last_signal_ts < self._cooldown:
+            return
+
+        # Don't stack more than 1 position
+        if len(self.positions) >= 1:
+            return
+
+        signal = self._compute_signal()
+        if not signal:
+            log.info("[Ascetix] No confluence — sitting out this window.")
+            return
+
+        result = self._find_btc_15min_market(signal)
+        if not result:
+            log.info("[Ascetix] No BTC 15-min market found — scanning gamma...")
+            # Fallback: scan gamma for active BTC short-term markets
+            try:
+                url = f"{cfg.GAMMA_URL}/markets?tag=bitcoin&active=true&limit=20"
+                r = requests.get(url, timeout=8)
+                markets_raw = r.json() if r.status_code == 200 else []
+                for m in markets_raw:
+                    q = m.get("question", "").lower()
+                    if "15" in q or "minute" in q:
+                        tokens = m.get("clobTokenIds", [])
+                        if len(tokens) >= 2:
+                            idx = 0 if signal == "UP" else 1
+                            result = {
+                                "market": m,
+                                "token_id": tokens[idx],
+                                "label": "YES/UP" if signal == "UP" else "NO/DOWN"
+                            }
+                            break
+            except Exception as e:
+                log.warning(f"[Ascetix] gamma fallback: {e}")
+
+        if not result:
+            log.info("[Ascetix] No suitable market found this cycle.")
+            return
+
+        balance = self.client.get_balance()
+        size = round(balance * self.CAPITAL_PCT, 2)
+        if size < 1.0:
+            log.info(f"[Ascetix] Balance too low: ${balance:.2f}")
+            return
+
+        market = result["market"]
+        token_id = result["token_id"]
+        mid_id = market.get("condition_id", market.get("id", ""))
+        price = self.client.get_price(token_id)
+
+        if not price:
+            log.warning("[Ascetix] Could not get price — skipping.")
+            return
+
+        # Only enter if shares are reasonably priced (not already near resolution)
+        if not (0.15 < price < 0.85):
+            log.info(f"[Ascetix] Price {price:.4f} out of entry range — skipping.")
+            return
+
+        oid = self.client.place_order(token_id, "BUY", price, size)
+        if oid:
+            self.positions.append({
+                "market_id": mid_id,
+                "token_id":  token_id,
+                "side":      "BUY",
+                "entry":     price,
+                "size":      size,
+                "opened_at": time.time(),
+            })
+            db.log_trade(self.NAME, mid_id, token_id, "BUY", price, size, oid, "open")
+            self._last_signal_ts = time.time()
+            tg(
+                f"⚡ <b>AscetixMode ENTRY</b>\n"
+                f"Signal: {signal} ({result['label']})\n"
+                f"Price: ${price:.4f} | Size: ${size:.2f}\n"
+                f"TP: ${self.TP_PRICE} | SL: -{self.SL_DROP_PCT*100:.0f}%\n"
+                f"{market.get('question','')[:55]}"
+            )
+
 # ============================================================================
 # ZEUS PRIME v2 — MAIN
 # ============================================================================
@@ -1041,6 +1323,7 @@ class ZeusPrimeV2:
             GrindTradingStrategy(self.client, self.risk),       # 8
             DayTradingMomentumStrategy(self.client, self.risk), # 9
             MeanReversionStrategy(self.client, self.risk),      # 10
+            AscetixModeStrategy(self.client, self.risk),         # 11 ★ MONEY ENGINE
         ]
         self.cycle = 0
         self.start_balance = self.client.get_balance()
@@ -1049,10 +1332,10 @@ class ZeusPrimeV2:
             f"⚡ <b>ZeusPrime v2.0 ONLINE</b>\n"
             f"Mode: {mode}\n"
             f"Capital: ${self.start_balance:.2f} USDC\n"
-            f"Strategies: {len(self.strategies)} active\n"
+            f"Strategies: {len(self.strategies)} active (AscetixMode ON)\n"
             f"Cycle: {self.CYCLE_SEC}s"
         )
-        log.info(f"ZeusPrime v2.0 ready. {len(self.strategies)} strategies loaded.")
+        log.info(f"ZeusPrime v2.2 ready. {len(self.strategies)} strategies loaded.")
 
     def report(self):
         balance = self.client.get_balance()

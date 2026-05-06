@@ -44,6 +44,12 @@ except ImportError:
     log_stub = logging.getLogger("ZeusPrime")
     log_stub.warning("kalshi_client.py not found — Kalshi disabled")
 
+try:
+    from oracle_prime import OraclePrimeStrategy
+    _ORACLE_AVAILABLE = True
+except ImportError:
+    _ORACLE_AVAILABLE = False
+
 # ============================================================================
 # BOOTSTRAP
 # ============================================================================
@@ -1440,16 +1446,25 @@ class ZeusPrimeV2:
             MeanReversionStrategy(self.client, self.risk),      # 10
             AscetixModeStrategy(self.client, self.risk),        # 11 ★ MONEY ENGINE
         ]
+
+        # Strategy 12: OraclePrime — Weather Edge (Kalshi-only)
+        if _ORACLE_AVAILABLE and self.kalshi:
+            self.strategies.append(
+                OraclePrimeStrategy(self.kalshi, self.risk)     # 12 🌤️ WEATHER EDGE
+            )
+            log.info("OraclePrime (Strategy 12) armed ✅")
         self.cycle = 0
         self.start_balance = self.client.get_balance()
         mode       = "🔴 LIVE" if not cfg.SIMULATE else "🟡 SIMULATE"
-        kalshi_tag = "✅ Kalshi ARMED" if self.kalshi else "⚪ Poly-only"
+        kalshi_tag  = "✅ Kalshi ARMED" if self.kalshi else "⚪ Poly-only"
+        oracle_tag  = "🌤️ OraclePrime ON" if (_ORACLE_AVAILABLE and self.kalshi) else "⚪ OraclePrime OFF"
         tg(
             f"⚡ <b>ZeusPrime v2.3 ONLINE</b>\n"
             f"Mode: {mode}\n"
             f"Capital: ${self.start_balance:.2f} USDC\n"
-            f"Strategies: {len(self.strategies)} active (AscetixMode ON)\n"
+            f"Strategies: {len(self.strategies)} active\n"
             f"Cross-platform: {kalshi_tag}\n"
+            f"Weather Edge: {oracle_tag}\n"
             f"Cycle: {self.CYCLE_SEC}s"
         )
         log.info(f"ZeusPrime v2.3 ready. {len(self.strategies)} strategies. Kalshi={'ON' if self.kalshi else 'OFF'}")

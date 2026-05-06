@@ -40,7 +40,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 SIMULATE       = os.getenv("SIMULATE_MODE", "true").lower() == "true"
 SCAN_INTERVAL  = int(os.getenv("ARB_SCAN_INTERVAL", "30"))
-MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.3"))
+MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.15"))
 FLASH_LOAN_FEE = 0.09
 GAS_BUFFER     = 0.10
 
@@ -51,7 +51,9 @@ NETWORK         = "polygon"
 DEX_LIST = [
     ("uniswap_v3",   "Uniswap V3"),
     ("quickswap_v2", "QuickSwap V2"),
+    ("quickswap_v3", "QuickSwap V3"),
     ("sushiswap",    "SushiSwap"),
+    ("balancer_v2",  "Balancer V2"),
 ]
 
 TOKENS = {
@@ -67,9 +69,11 @@ WATCH_PAIRS = [
     ("WPOL",  "USDT0"),
     ("WETH",  "USDT0"),
     ("WBTC",  "USDC"),
+    ("WBTC",  "WETH"),   # NEW — Balancer vs Uniswap gap seen live
     ("WPOL",  "WETH"),
     ("WETH",  "DAI"),
     ("DAI",   "USDT0"),
+    ("WPOL",  "USDC"),   # NEW
 ]
 
 

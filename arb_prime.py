@@ -80,18 +80,26 @@ WATCH_PAIRS = [
 # ── Price Fetcher ──────────────────────────────────────────────────────────
 
 def get_pool_for_pair(dex_id: str, token_a: str, token_b: str) -> Optional[dict]:
-    """Find highest-volume pool containing both tokens on given DEX."""
+    """
+    Find highest-volume EXACTLY 2-token pool containing both tokens on given DEX.
+    Multi-token pools (Balancer 4/8-token) are excluded — their price_usd is
+    not comparable to standard 2-token AMM pools and causes false arb signals.
+    NOTE: do NOT pass limit/sort params — they break the API (returns 0 pools).
+    """
     addr_a = TOKENS[token_a].lower()
     addr_b = TOKENS[token_b].lower()
     url    = f"{DEXPAPRIKA_BASE}/networks/{NETWORK}/dexes/{dex_id}/pools"
-    # NOTE: do NOT pass limit/sort params — they break the API and return 0 pools
     try:
         r = requests.get(url, timeout=12)
         r.raise_for_status()
         best = None
         best_vol = 0.0
         for pool in r.json().get("pools", []):
-            ids = [t["id"].lower() for t in pool.get("tokens", [])]
+            tokens = pool.get("tokens", [])
+            # STRICT: only 2-token pools — multi-token pool prices are not comparable
+            if len(tokens) != 2:
+                continue
+            ids = [t["id"].lower() for t in tokens]
             if addr_a in ids and addr_b in ids:
                 vol = pool.get("volume_usd", 0) or 0
                 if best is None or vol > best_vol:

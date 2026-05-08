@@ -1,4 +1,4 @@
-# ⚡ Zeus Prime - Autonomous Polymarket Trading Bot
+# ⚡ OpenTrade - Autonomous Polymarket Trading Bot
 
 The most advanced self-contained trading bot for Polymarket. Runs 24/7 with zero human intervention. Learns and adapts continuously.
 
@@ -191,7 +191,7 @@ trade.py                 # Main bot (all logic)
 ├── FailureReflector     # Loss analysis & adjustment
 ├── AutonomyEngine       # Strategy orchestration
 ├── 10 Strategy Classes  # Trading logic
-└── ZeusPrimeBot         # Main orchestrator
+└── OpenTradeBot         # Main orchestrator
 ```
 
 ---
@@ -230,7 +230,7 @@ Open-trade-/
 ### Bot won't start
 1. Check `.env` configuration: `python3 trade.py --check-config`
 2. Ensure Python 3.10+: `python3 --version`
-3. Check logs: `cat logs/zeus_prime_*.log`
+3. Check logs: `cat logs/open_trade_*.log`
 
 ### No trades executing
 1. Verify USDC balance in proxy wallet

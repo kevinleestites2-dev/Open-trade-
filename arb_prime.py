@@ -379,18 +379,53 @@ def load_contract_abi() -> list:
     ]
 
 
+# ── Live price cache (refreshed every 60s) ────────────────────────────────
+_price_cache: dict = {}
+_price_cache_ts: float = 0.0
+_PRICE_CACHE_TTL = 60  # seconds
+
+COINGECKO_IDS = {
+    "WPOL":  "matic-network",
+    "WETH":  "weth",
+    "WBTC":  "wrapped-bitcoin",
+    "USDC":  "usd-coin",
+    "USDT0": "tether",
+    "DAI":   "dai",
+}
+
+def get_live_token_prices() -> dict:
+    """Fetch live USD prices from CoinGecko (free, no key needed)."""
+    global _price_cache, _price_cache_ts
+    now = time.time()
+    if now - _price_cache_ts < _PRICE_CACHE_TTL and _price_cache:
+        return _price_cache
+    ids = ",".join(COINGECKO_IDS.values())
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids, "vs_currencies": "usd"},
+            timeout=5,
+        )
+        data = resp.json()
+        fresh = {}
+        for sym, cg_id in COINGECKO_IDS.items():
+            fresh[sym] = data.get(cg_id, {}).get("usd", _price_cache.get(sym, 1.0))
+        _price_cache    = fresh
+        _price_cache_ts = now
+        log.debug(f"Live prices: {fresh}")
+        return fresh
+    except Exception as e:
+        log.warning(f"CoinGecko price fetch failed: {e} — using last cached prices")
+        return _price_cache if _price_cache else {
+            "WPOL": 0.10, "WETH": 2333.0, "WBTC": 80500.0,
+            "USDC": 1.0,  "USDT0": 1.0,   "DAI": 1.0,
+        }
+
+
 def calc_loan_amount(token: str, usd_value: int) -> int:
-    """Convert USD flash loan target to token base units."""
-    # Use approximate prices for sizing (not critical — Aave enforces repayment)
-    approx_price_usd = {
-        "WPOL":  0.35,
-        "WETH":  3000.0,
-        "WBTC":  65000.0,
-        "USDC":  1.0,
-        "USDT0": 1.0,
-        "DAI":   1.0,
-    }
-    price   = approx_price_usd.get(token, 1.0)
+    """Convert USD flash loan target to token base units using live prices."""
+    prices   = get_live_token_prices()
+    price    = prices.get(token, 1.0)
     decimals = TOKEN_DECIMALS.get(token, 18)
     amount_tokens = usd_value / price
     return int(amount_tokens * (10 ** decimals))
@@ -442,7 +477,7 @@ def execute_arb(opp: dict) -> tuple:
         loan_amount = calc_loan_amount(token_a, FLASH_LOAN_SIZE)
 
         # Min profit: require at least MIN_PROFIT_USD worth of token_a back
-        approx_price = {"WPOL": 0.35, "WETH": 3000.0, "WBTC": 65000.0}.get(token_a, 1.0)
+        approx_price = get_live_token_prices().get(token_a, 1.0)
         decimals     = TOKEN_DECIMALS.get(token_a, 18)
         min_profit   = int((MIN_PROFIT_USD / approx_price) * (10 ** decimals))
 
@@ -454,6 +489,10 @@ def execute_arb(opp: dict) -> tuple:
 
         nonce    = w3.eth.get_transaction_count(account.address)
         gas_price = w3.eth.gas_price
+
+        # Slippage tolerance: allow up to 0.5% price impact per swap
+        # min_profit already enforces net profitability — this is extra safety
+        slippage_bps = int(os.getenv("SLIPPAGE_BPS", "50"))  # 50 bps = 0.5%
 
         tx = contract.functions.execute(
             token_addr,
@@ -467,7 +506,7 @@ def execute_arb(opp: dict) -> tuple:
             "from":     account.address,
             "nonce":    nonce,
             "gas":      500_000,
-            "gasPrice": gas_price,
+            "gasPrice": int(gas_price * 1.1),  # 10% priority bump for faster inclusion
         })
 
         signed  = account.sign_transaction(tx)

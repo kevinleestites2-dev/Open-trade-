@@ -42,8 +42,8 @@ SIMULATE       = os.getenv("SIMULATE_MODE", "true").lower() == "true"
 SCAN_INTERVAL  = int(os.getenv("ARB_SCAN_INTERVAL", "30"))
 
 # Minimum NET profit % after ALL fees before firing an alert
-# Set to 0.25% — means the raw spread must be ~0.85%+ to survive fees
-MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.25"))
+# Set to 0.10% — means the raw spread must be ~0.74%+ to survive fees
+MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.10"))
 
 # Flash loan + estimated gas (flat %)
 FLASH_LOAN_FEE = 0.09   # Aave V3: 0.09%
@@ -230,6 +230,13 @@ def scan_pair(token_a: str, token_b: str) -> Optional[dict]:
 
     if best_opp["net_profit_pct"] < MIN_PROFIT_PCT:
         log.info(f"  Below threshold ({MIN_PROFIT_PCT}%) — no alert")
+        # Near-miss diagnostic: log if within 2x of threshold (warming up the engine)
+        if best_opp["net_profit_pct"] > 0 and best_opp["net_profit_pct"] >= MIN_PROFIT_PCT * 0.5:
+            log.info(
+                f"  📊 NEAR-MISS: {best_opp['symbol']} | "
+                f"net={best_opp['net_profit_pct']:.4f}% (threshold={MIN_PROFIT_PCT}%) | "
+                f"buy={best_opp['buy_dex']} sell={best_opp['sell_dex']}"
+            )
         return None
 
     log.info(f"  OPPORTUNITY: buy {best_opp['buy_dex']} | sell {best_opp['sell_dex']}")

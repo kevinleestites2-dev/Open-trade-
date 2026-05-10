@@ -97,17 +97,47 @@ CITY_COORDS: Dict[str, Tuple[float, float]] = {
     "richmond":     (37.5407, -77.4360),
     "cincinnati":   (39.1031, -84.5120),
     "milwaukee":    (43.0389, -87.9065),
+    # International — Open-Meteo handles these globally; coords unlock the fallback
+    "london":       (51.5074, -0.1278),
+    "paris":        (48.8566,  2.3522),
+    "toronto":      (43.6532, -79.3832),
+    "mexico city":  (19.4326, -99.1332),
+    "cdmx":         (19.4326, -99.1332),
+    "bogota":       ( 4.7110, -74.0721),
+    "buenos aires": (-34.6037, -58.3816),
+    "sao paulo":    (-23.5505, -46.6333),
+    "rio de janeiro":(-22.9068, -43.1729),
+    "sydney":       (-33.8688, 151.2093),
+    "tokyo":        (35.6762, 139.6503),
+    "dubai":        (25.2048,  55.2708),
+    "berlin":       (52.5200,  13.4050),
+    "madrid":       (40.4168,  -3.7038),
+    "amsterdam":    (52.3676,   4.9041),
+    "mumbai":       (19.0760,  72.8777),
+    "lagos":        ( 6.5244,   3.3792),
+    "nairobi":      (-1.2864,  36.8172),
 }
 
 # ─────────────────────────────────────────────────────────────
 # NWS CLIENT
 # ─────────────────────────────────────────────────────────────
 class NWSClient:
-    """Pulls forecast data from api.weather.gov — no API key needed."""
+    """
+    Pulls forecast data from api.weather.gov — no API key needed.
+    For cities outside the NWS coverage map, Open-Meteo is used as fallback
+    (global coverage, also no API key).
+    """
 
     _grid_cache: Dict[str, dict] = {}   # coords → grid metadata
     _data_cache: Dict[str, Tuple[float, dict]] = {}  # grid_url → (ts, data)
     CACHE_TTL = 1800  # 30 min
+    _open_meteo_instance = None  # lazily initialised after OpenMeteoClient is defined
+
+    @property
+    def _open_meteo(self):
+        if NWSClient._open_meteo_instance is None:
+            NWSClient._open_meteo_instance = OpenMeteoClient()
+        return NWSClient._open_meteo_instance
 
     def _get_grid(self, lat: float, lon: float) -> Optional[dict]:
         key = f"{lat:.4f},{lon:.4f}"
@@ -164,38 +194,60 @@ class NWSClient:
                     coords = v
                     break
         if not coords:
-            log.warning(f"City not in coords map: {city}")
+            log.warning(f"City not in NWS coords map: {city} — Open-Meteo fallback not available at this level")
             return None
         grid = self._get_grid(*coords)
         if not grid:
+            log.warning(f"NWS grid lookup failed for {city} — will fall back to Open-Meteo in callers")
             return None
-        return self._get_grid_data(grid["forecastGridData"])
+        data = self._get_grid_data(grid["forecastGridData"])
+        if data is None:
+            log.warning(f"NWS grid data empty for {city} — will fall back to Open-Meteo in callers")
+        return data
+
+    def _get_coords(self, city: str) -> Optional[Tuple[float, float]]:
+        """Resolve city string to (lat, lon), including fuzzy match."""
+        city_lower = city.lower().strip()
+        coords = CITY_COORDS.get(city_lower)
+        if coords:
+            return coords
+        for k, v in CITY_COORDS.items():
+            if city_lower in k or k in city_lower:
+                return v
+        return None
 
     @staticmethod
     def c_to_f(c: float) -> float:
         return c * 9 / 5 + 32
 
     def max_temp_on_date(self, city: str, target_date: datetime.date) -> Optional[float]:
-        """Returns forecasted max temp in °F for a specific date."""
+        """Returns forecasted max temp in °F for a specific date. Falls back to Open-Meteo."""
         data = self.get_forecast(city)
-        if not data:
-            return None
         best = None
-        for v in data.get("maxTemperature", {}).get("values", []):
-            ts = v["validTime"].split("/")[0]
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt.date() == target_date and v["value"] is not None:
-                best = self.c_to_f(v["value"])
+        if data:
+            for v in data.get("maxTemperature", {}).get("values", []):
+                ts = v["validTime"].split("/")[0]
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.date() == target_date and v["value"] is not None:
+                    best = self.c_to_f(v["value"])
+        if best is None:
+            coords = self._get_coords(city)
+            if coords:
+                best = self._open_meteo.max_temp_on_date(coords[0], coords[1], target_date)
         return best
 
     def prob_exceed_temp(self, city: str, threshold_f: float, target_date: datetime.date) -> float:
         """
         Returns probability (0.0–1.0) that max temp exceeds threshold_f on target_date.
-        Uses NWS hourly data to build a distribution + uncertainty model.
+        NWS primary, Open-Meteo fallback.
         """
         data = self.get_forecast(city)
         if not data:
-            return 0.5  # unknown → assume coin flip
+            coords = self._get_coords(city)
+            if coords:
+                log.info(f"prob_exceed_temp: NWS miss for {city}, using Open-Meteo fallback")
+                return self._open_meteo.prob_exceed_temp(coords[0], coords[1], threshold_f, target_date)
+            return 0.5
 
         # Collect all hourly max temps on that day
         temps_f = []
@@ -214,64 +266,218 @@ class NWSClient:
                     temps_f.append(self.c_to_f(v["value"]))
 
         if not temps_f:
+            coords = self._get_coords(city)
+            if coords:
+                log.info(f"prob_exceed_temp: no NWS values for {city} on {target_date}, using Open-Meteo")
+                return self._open_meteo.prob_exceed_temp(coords[0], coords[1], threshold_f, target_date)
             return 0.5
 
         forecast_max = max(temps_f)
-
-        # NWS forecast uncertainty grows with time horizon
         days_out = (target_date - datetime.now(timezone.utc).date()).days
-        # σ ≈ 2°F at 1 day, 4°F at 3 days, 6°F at 7 days
         sigma = max(2.0, min(6.0, 2.0 + days_out * 0.6))
-
-        # Probability that actual max > threshold given forecast_max ± sigma
-        # Using normal CDF approximation
         z = (forecast_max - threshold_f) / sigma
-        prob = _normal_cdf(z)
-        return round(prob, 4)
+        return round(_normal_cdf(z), 4)
 
     def prob_rain(self, city: str, target_date: datetime.date) -> float:
-        """Returns NWS probability of precipitation on target_date (0.0–1.0)."""
+        """Returns NWS probability of precipitation on target_date (0.0–1.0). Open-Meteo fallback."""
         data = self.get_forecast(city)
-        if not data:
-            return 0.5
         probs = []
-        for v in data.get("probabilityOfPrecipitation", {}).get("values", []):
-            ts = v["validTime"].split("/")[0]
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt.date() == target_date and v["value"] is not None:
-                probs.append(v["value"] / 100.0)
-        return max(probs) if probs else 0.5
+        if data:
+            for v in data.get("probabilityOfPrecipitation", {}).get("values", []):
+                ts = v["validTime"].split("/")[0]
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.date() == target_date and v["value"] is not None:
+                    probs.append(v["value"] / 100.0)
+        if probs:
+            return max(probs)
+        coords = self._get_coords(city)
+        if coords:
+            log.info(f"prob_rain: NWS miss for {city}, using Open-Meteo fallback")
+            return self._open_meteo.prob_rain(coords[0], coords[1], target_date)
+        return 0.5
+
+    def prob_snow(self, city: str, target_date: datetime.date, inches_threshold: float = 0.1) -> float:
+        """
+        Returns probability of snowfall on target_date meeting inches_threshold.
+        NWS primary, Open-Meteo fallback (global coverage).
+        """
+        data = self.get_forecast(city)
+        nws_hit = False
+
+        if data:
+            # Primary: snowfallAmount (mm → inches)
+            snow_vals = []
+            for v in data.get("snowfallAmount", {}).get("values", []):
+                ts = v["validTime"].split("/")[0]
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.date() == target_date and v["value"] is not None:
+                    snow_vals.append(v["value"] * 0.0393701)
+            if snow_vals:
+                nws_hit = True
+                expected = max(snow_vals)
+                if expected <= 0:
+                    return 0.02
+                ratio = expected / inches_threshold
+                return round(min(ratio / (1 + ratio), 0.97), 3)
+
+            # Internal fallback: precip × cold-temp probability
+            precip_prob = self.prob_rain(city, target_date)
+            max_temp    = self.max_temp_on_date(city, target_date)
+            if max_temp is not None:
+                nws_hit = True
+                temp_snow_p = 1 / (1 + math.exp((max_temp - 34) / 3))
+                return round(precip_prob * temp_snow_p, 3)
+
+        # Open-Meteo fallback
+        coords = self._get_coords(city)
+        if coords:
+            log.info(f"prob_snow: NWS miss for {city}, using Open-Meteo fallback")
+            return self._open_meteo.prob_snow(coords[0], coords[1], target_date, inches_threshold)
+        return 0.5
 
     def prob_wind(self, city: str, mph_threshold: int, target_date: datetime.date) -> float:
-        """Returns NWS probability of wind gusts exceeding mph_threshold."""
+        """Returns NWS probability of wind gusts exceeding mph_threshold. Open-Meteo fallback."""
         data = self.get_forecast(city)
+        probs = []
+        if data:
+            # NWS has potentialOf[X]mphWinds fields
+            field_map = {
+                15: "potentialOf15mphWinds",
+                20: "potentialOf20mphWinds",
+                25: "potentialOf25mphWinds",
+                30: "potentialOf30mphWindGusts",
+                35: "potentialOf35mphWinds",
+                40: "potentialOf40mphWindGusts",
+                45: "potentialOf45mphWinds",
+                50: "potentialOf50mphWindGusts",
+                60: "potentialOf60mphWindGusts",
+            }
+            closest = min(field_map.keys(), key=lambda x: abs(x - mph_threshold))
+            field = field_map[closest]
+            for v in data.get(field, {}).get("values", []):
+                ts = v["validTime"].split("/")[0]
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.date() == target_date and v["value"] is not None:
+                    probs.append(v["value"] / 100.0)
+        if probs:
+            return max(probs)
+        coords = self._get_coords(city)
+        if coords:
+            log.info(f"prob_wind: NWS miss for {city}, using Open-Meteo fallback")
+            return self._open_meteo.prob_wind(coords[0], coords[1], mph_threshold, target_date)
+        return 0.5
+
+
+# ─────────────────────────────────────────────────────────────
+# OPEN-METEO CLIENT  — global fallback, no API key required
+# Expands NWS's 38-city US limit to any lat/lon globally.
+# ─────────────────────────────────────────────────────────────
+class OpenMeteoClient:
+    """
+    Fetches hourly weather from Open-Meteo (open-meteo.com).
+    Covers the entire globe, no API key needed.
+    Used as fallback when NWS returns None (city not in CITY_COORDS or NWS outage).
+    """
+    BASE_URL = "https://api.open-meteo.com/v1/forecast"
+    _cache: Dict[str, Tuple[float, dict]] = {}
+    CACHE_TTL = 1800
+
+    def get_forecast(self, lat: float, lon: float) -> Optional[dict]:
+        key = f"{lat:.4f},{lon:.4f}"
+        now = time.time()
+        if key in self._cache:
+            ts, data = self._cache[key]
+            if now - ts < self.CACHE_TTL:
+                return data
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,precipitation_probability,precipitation,snowfall,windspeed_10m,windgusts_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum,windgusts_10m_max,precipitation_probability_max",
+            "temperature_unit": "fahrenheit",
+            "windspeed_unit": "mph",
+            "precipitation_unit": "inch",
+            "timezone": "auto",
+            "forecast_days": 8,
+        }
+        try:
+            r = requests.get(self.BASE_URL, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            self._cache[key] = (now, data)
+            return data
+        except Exception as e:
+            log.error(f"Open-Meteo fetch failed ({lat},{lon}): {e}")
+            return None
+
+    def prob_exceed_temp(self, lat: float, lon: float, threshold_f: float, target_date: datetime.date) -> float:
+        data = self.get_forecast(lat, lon)
         if not data:
             return 0.5
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        maxes = daily.get("temperature_2m_max", [])
+        for d, mx in zip(dates, maxes):
+            if datetime.strptime(d, "%Y-%m-%d").date() == target_date and mx is not None:
+                days_out = (target_date - datetime.now(timezone.utc).date()).days
+                sigma = max(2.0, min(6.0, 2.0 + days_out * 0.6))
+                z = (mx - threshold_f) / sigma
+                return round(_normal_cdf(z), 4)
+        return 0.5
 
-        # NWS has potentialOf[X]mphWinds fields
-        field_map = {
-            15: "potentialOf15mphWinds",
-            20: "potentialOf20mphWinds",
-            25: "potentialOf25mphWinds",
-            30: "potentialOf30mphWindGusts",
-            35: "potentialOf35mphWinds",
-            40: "potentialOf40mphWindGusts",
-            45: "potentialOf45mphWinds",
-            50: "potentialOf50mphWindGusts",
-            60: "potentialOf60mphWindGusts",
-        }
-        # find closest threshold
-        closest = min(field_map.keys(), key=lambda x: abs(x - mph_threshold))
-        field = field_map[closest]
+    def prob_rain(self, lat: float, lon: float, target_date: datetime.date) -> float:
+        data = self.get_forecast(lat, lon)
+        if not data:
+            return 0.5
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        probs = daily.get("precipitation_probability_max", [])
+        for d, p in zip(dates, probs):
+            if datetime.strptime(d, "%Y-%m-%d").date() == target_date and p is not None:
+                return p / 100.0
+        return 0.5
 
-        probs = []
-        for v in data.get(field, {}).get("values", []):
-            ts = v["validTime"].split("/")[0]
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt.date() == target_date and v["value"] is not None:
-                probs.append(v["value"] / 100.0)
+    def prob_snow(self, lat: float, lon: float, target_date: datetime.date, inches_threshold: float = 0.1) -> float:
+        data = self.get_forecast(lat, lon)
+        if not data:
+            return 0.5
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        snow  = daily.get("snowfall_sum", [])
+        for d, s in zip(dates, snow):
+            if datetime.strptime(d, "%Y-%m-%d").date() == target_date and s is not None:
+                if s <= 0:
+                    return 0.02
+                ratio = s / inches_threshold
+                return round(min(ratio / (1 + ratio), 0.97), 3)
+        return 0.5
 
-        return max(probs) if probs else 0.5
+    def prob_wind(self, lat: float, lon: float, mph_threshold: float, target_date: datetime.date) -> float:
+        data = self.get_forecast(lat, lon)
+        if not data:
+            return 0.5
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        gusts = daily.get("windgusts_10m_max", [])
+        for d, g in zip(dates, gusts):
+            if datetime.strptime(d, "%Y-%m-%d").date() == target_date and g is not None:
+                days_out = (target_date - datetime.now(timezone.utc).date()).days
+                sigma = max(3.0, min(8.0, 3.0 + days_out * 0.5))
+                z = (g - mph_threshold) / sigma
+                return round(_normal_cdf(z), 4)
+        return 0.5
+
+    def max_temp_on_date(self, lat: float, lon: float, target_date: datetime.date) -> Optional[float]:
+        data = self.get_forecast(lat, lon)
+        if not data:
+            return None
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        maxes = daily.get("temperature_2m_max", [])
+        for d, mx in zip(dates, maxes):
+            if datetime.strptime(d, "%Y-%m-%d").date() == target_date:
+                return mx
+        return None
 
 
 def _normal_cdf(z: float) -> float:
@@ -323,6 +529,9 @@ def parse_weather_market(question: str, ticker: str) -> Optional[dict]:
         result["threshold"] = float(m.group(1)) if m else None
     elif any(w in q for w in ["snow", "snowfall", "blizzard"]):
         result["type"] = "snow"
+        # Extract inch threshold: "3+ inches", "at least 2 inches", "1 inch of snow"
+        m = re.search(r'(\d+(?:\.\d+)?)\s*\+?\s*inch(?:es)?', q)
+        result["threshold"] = float(m.group(1)) if m else 0.1
     else:
         return None
 
@@ -349,15 +558,55 @@ def parse_weather_market(question: str, ticker: str) -> Optional[dict]:
     # "tomorrow"
     elif "tomorrow" in q:
         result["date"] = today + timedelta(days=1)
-    # "this week" / "this weekend"
-    elif "this week" in q or "this weekend" in q:
+    # "this weekend"
+    elif "this weekend" in q:
+        days_until_sat = (5 - today.weekday()) % 7
+        result["date"] = today + timedelta(days=days_until_sat if days_until_sat > 0 else 7)
+    # "this week" / "current week"
+    elif "this week" in q or "current week" in q:
         result["date"] = today + timedelta(days=2)  # mid-week estimate
-    # specific month/day: "may 8", "may 9th"
+    # "week of May 12", "week of may 9th"
+    elif re.search(r'week\s+of\s+\w+\s+\d{1,2}', q):
+        m = re.search(r'week\s+of\s+(\w+)\s+(\d{1,2})', q)
+        if m:
+            month_map2 = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                          "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+            mon_str = m.group(1)[:3].lower()
+            day_num = int(m.group(2))
+            mon_num = month_map2.get(mon_str, today.month)
+            year = today.year
+            candidate = datetime(year, mon_num, day_num).date()
+            if candidate < today:
+                candidate = datetime(year + 1, mon_num, day_num).date()
+            result["date"] = candidate + timedelta(days=3)  # mid-week
+    # "next Monday/Tuesday/..."
+    elif re.search(r'next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)', q):
+        dow_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
+                   "friday":4,"saturday":5,"sunday":6}
+        m = re.search(r'next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)', q)
+        target_dow = dow_map[m.group(1)]
+        days_ahead = (target_dow - today.weekday() + 7) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # "next X" = the one after the coming one
+        result["date"] = today + timedelta(days=days_ahead)
+    # "on Monday/Tuesday/..." (without "next") = nearest upcoming
+    elif re.search(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', q):
+        dow_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
+                   "friday":4,"saturday":5,"sunday":6}
+        m = re.search(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', q)
+        target_dow = dow_map[m.group(1)]
+        days_ahead = (target_dow - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        result["date"] = today + timedelta(days=days_ahead)
+    # specific month/day: "may 8", "may 9th", "may 9", "9th", "the 12th"
     else:
         month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
                      "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        # "May 9th" / "may 12"
+        matched = False
         for mon, num in month_map.items():
-            m = re.search(rf'{mon}\w*\s+(\d{{1,2}})', q)
+            m = re.search(rf'\b{mon}\w*\s+(\d{{1,2}})(?:st|nd|rd|th)?\b', q)
             if m:
                 day = int(m.group(1))
                 year = today.year
@@ -365,7 +614,24 @@ def parse_weather_market(question: str, ticker: str) -> Optional[dict]:
                 if candidate < today:
                     candidate = datetime(year + 1, num, day).date()
                 result["date"] = candidate
+                matched = True
                 break
+        # Ordinal-only: "on the 12th", "by the 9th" — assume current or next month
+        if not matched:
+            m = re.search(r'\bthe\s+(\d{1,2})(?:st|nd|rd|th)\b', q)
+            if m:
+                day = int(m.group(1))
+                year = today.year
+                try:
+                    candidate = datetime(year, today.month, day).date()
+                    if candidate < today:
+                        # Roll to next month
+                        next_month = today.month % 12 + 1
+                        next_year  = year if next_month > 1 else year + 1
+                        candidate  = datetime(next_year, next_month, day).date()
+                    result["date"] = candidate
+                except ValueError:
+                    pass  # invalid day for month — keep today default
 
     return result
 
@@ -464,6 +730,14 @@ class OraclePrimeStrategy:
             nws_prob = self.nws.prob_wind(city, threshold, date)
             if dirn == "below":
                 nws_prob = 1.0 - nws_prob
+
+        elif mtype == "snow":
+            # threshold in inches — extracted from question or default 0.1"
+            threshold = parsed.get("threshold")
+            inches = float(threshold) if threshold else 0.1
+            nws_prob = self.nws.prob_snow(city, date, inches_threshold=inches)
+            if dirn == "below":
+                nws_prob = 1.0 - nws_prob  # "will it NOT snow?"
 
         if nws_prob is None:
             return None

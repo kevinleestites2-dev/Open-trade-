@@ -316,6 +316,165 @@ class PolyClient:
             return False
 
 # ============================================================================
+# TELEGRAM COMMAND HANDLER
+# ============================================================================
+
+class TelegramCommands:
+    """
+    Listens for Telegram commands via long-polling getUpdates.
+    Runs in a background thread so it never blocks the main engine loop.
+
+    Commands:
+      /stats  — strategy-level P&L breakdown
+      /pnl    — running P&L vs start balance
+      /chart  — equity curve as text chart
+      /help   — command list
+    """
+    def __init__(self, token: str, chat_id: str, db_ref, zeus_ref):
+        self.token   = token
+        self.chat_id = str(chat_id)
+        self.db      = db_ref
+        self.zeus    = zeus_ref  # ZeusPrimeV2 instance
+        self._offset = 0
+        self._running = True
+
+    def _api(self, method: str, **kwargs):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.token}/{method}",
+                json=kwargs, timeout=30
+            )
+            return r.json()
+        except Exception as e:
+            log.warning(f"[TG-CMD] {method} error: {e}")
+            return {}
+
+    def _send(self, text: str):
+        self._api("sendMessage", chat_id=self.chat_id, text=text, parse_mode="HTML")
+
+    def _handle(self, text: str):
+        cmd = text.strip().lower().split("@")[0]
+
+        if cmd == "/help":
+            self._send(
+                "⚡ <b>ZeusPrime v2.3 Commands</b>\n\n"
+                "/pnl — Current P&amp;L vs start balance\n"
+                "/stats — Strategy breakdown\n"
+                "/chart — Equity curve\n"
+                "/help — This menu"
+            )
+
+        elif cmd == "/pnl":
+            try:
+                bal = self.zeus.client.get_balance()
+                start = self.zeus.start_balance or bal
+                pnl = bal - start
+                pct = (pnl / start * 100) if start else 0
+                emoji = "📈" if pnl >= 0 else "📉"
+                self._send(
+                    f"{emoji} <b>ZeusPrime P&amp;L</b>\n"
+                    f"Balance: ${bal:.2f}\n"
+                    f"Start:   ${start:.2f}\n"
+                    f"P&amp;L:     ${pnl:+.2f} ({pct:+.2f}%)\n"
+                    f"Cycle:   #{self.zeus.cycle}"
+                )
+            except Exception as e:
+                self._send(f"Error: {e}")
+
+        elif cmd == "/stats":
+            try:
+                rows = self.db.conn.execute(
+                    "SELECT strategy, COUNT(*) as trades, "
+                    "SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END) as wins, "
+                    "SUM(CASE WHEN status='sl' THEN 1 ELSE 0 END) as losses, "
+                    "ROUND(SUM(pnl),2) as total_pnl "
+                    "FROM trades GROUP BY strategy ORDER BY total_pnl DESC"
+                ).fetchall()
+                if not rows:
+                    self._send("📊 No trades recorded yet.")
+                    return
+                lines = ["📊 <b>Strategy Performance</b>\n"]
+                for strategy, trades, wins, losses, total_pnl in rows:
+                    wr = (wins / trades * 100) if trades else 0
+                    emoji = "📈" if (total_pnl or 0) >= 0 else "📉"
+                    lines.append(
+                        f"{emoji} <b>{strategy}</b>\n"
+                        f"  Trades: {trades} | W: {wins} L: {losses} ({wr:.0f}% WR)\n"
+                        f"  P&amp;L: ${total_pnl:+.2f}"
+                    )
+                self._send("\n".join(lines))
+            except Exception as e:
+                self._send(f"Error: {e}")
+
+        elif cmd == "/chart":
+            try:
+                rows = self.db.conn.execute(
+                    "SELECT balance FROM snapshots ORDER BY id DESC LIMIT 20"
+                ).fetchall()
+                if not rows:
+                    self._send("📉 No snapshot data yet. Run a few cycles first.")
+                    return
+                balances = [r[0] for r in reversed(rows)]
+                # ASCII equity curve
+                mn, mx = min(balances), max(balances)
+                height = 6
+                chart_lines = []
+                chart_lines.append(f"<pre>Equity Curve (last {len(balances)} snapshots)")
+                chart_lines.append(f"High: ${mx:.2f}  Low: ${mn:.2f}")
+                chart_lines.append("")
+                if mx == mn:
+                    chart_lines.append("─" * len(balances) + "  flat")
+                else:
+                    rng = mx - mn
+                    rows_grid = []
+                    for h in range(height, -1, -1):
+                        threshold = mn + (h / height) * rng
+                        row_label = f"${threshold:.1f} "
+                        row_chars = ""
+                        for b in balances:
+                            if b >= threshold:
+                                row_chars += "█"
+                            else:
+                                row_chars += " "
+                        rows_grid.append(row_label + "|" + row_chars)
+                    chart_lines.extend(rows_grid)
+                    chart_lines.append("       +" + "─" * len(balances))
+                    chart_lines.append(f"        0{'':>{len(balances)-2}}{len(balances)}")
+                chart_lines.append("</pre>")
+                self._send("\n".join(chart_lines))
+            except Exception as e:
+                self._send(f"Error: {e}")
+
+    def poll(self):
+        """Background poll loop — runs in a daemon thread."""
+        log.info("[TG-CMD] Command listener started.")
+        while self._running:
+            try:
+                data = self._api("getUpdates", offset=self._offset, timeout=25)
+                for update in data.get("result", []):
+                    self._offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    chat = str(msg.get("chat", {}).get("id", ""))
+                    text = msg.get("text", "")
+                    if chat == self.chat_id and text.startswith("/"):
+                        log.info(f"[TG-CMD] Received: {text}")
+                        self._handle(text)
+            except Exception as e:
+                log.warning(f"[TG-CMD] poll error: {e}")
+                time.sleep(5)
+        log.info("[TG-CMD] Listener stopped.")
+
+    def start(self):
+        import threading
+        t = threading.Thread(target=self.poll, daemon=True)
+        t.start()
+        return t
+
+    def stop(self):
+        self._running = False
+
+
+# ============================================================================
 # RISK MANAGER
 # ============================================================================
 
@@ -348,8 +507,20 @@ class RiskManager:
                 return False
         return True
 
-    def position_size(self, balance: float) -> float:
-        return max(1.0, round(balance * cfg.MAX_POSITION_PCT, 2))
+    def position_size(self, balance: float, confidence: float = 0.0) -> float:
+        """
+        Dynamic Kelly sizing.
+        confidence=0.0  → standard cap (MAX_POSITION_PCT = 5%)
+        confidence=0.5  → 1.5x multiplier  (7.5%)
+        confidence=1.0  → 2.5x multiplier  (12.5%) — hard cap 15%
+        """
+        if confidence > 0:
+            # Kelly scale: 1.0 + 1.5 * confidence (clamped at 2.5x, hard cap 15%)
+            multiplier = min(1.0 + 1.5 * confidence, 2.5)
+            pct = min(cfg.MAX_POSITION_PCT * multiplier, 0.15)
+        else:
+            pct = cfg.MAX_POSITION_PCT
+        return max(1.0, round(balance * pct, 2))
 
 # ============================================================================
 # BASE STRATEGY
@@ -574,10 +745,13 @@ class YesNoArbStrategy(Strategy):
 
             # Buy YES on cheap venue
             cheap_oid = cheap_client.place_order(cheap_id, "BUY", cheap_p, size)
-            # Buy NO on dear venue (NO token_id = token ending -NO)
-            no_id_dear = dear_id.rsplit("-", 1)[0] + "-NO" if dear_venue == "Kalshi" \
-                         else km["tokens"][1]["token_id"] if dear_venue == "Poly" \
-                         else pm["tokens"][1]["token_id"]
+            # Buy NO on dear venue
+            # Kalshi: token_id is "<TICKER>-YES", flip to "<TICKER>-NO"
+            # Poly:   NO token is tokens[1]["token_id"] from the Polymarket market (pm)
+            if dear_venue == "Kalshi":
+                no_id_dear = kals_yes_id.rsplit("-", 1)[0] + "-NO"
+            else:  # dear_venue == "Poly"
+                no_id_dear = pm["tokens"][1]["token_id"]
             dear_oid  = dear_client.place_order(no_id_dear, "BUY", 1 - dear_p, size)
 
             if cheap_oid or dear_oid:
@@ -1270,11 +1444,46 @@ class AscetixModeStrategy(Strategy):
 
         log.info(f"[Ascetix] Score: UP={signals['UP']} DOWN={signals['DOWN']}")
 
+        max_score = max(signals["UP"], signals["DOWN"])
         if signals["UP"] >= 3:
             return "UP"
         elif signals["DOWN"] >= 3:
             return "DOWN"
         return None
+
+    def _compute_signal_with_confidence(self) -> tuple:
+        """Returns (signal, confidence) where confidence is 0.0-1.0."""
+        funding = self._get_funding_rate()
+        ob_bias = self._get_orderbook_bias()
+        liq_bias = self._get_liquidation_bias()
+        mom_bias = self._get_btc_momentum()
+
+        signals = {"UP": 0, "DOWN": 0}
+
+        if funding is not None:
+            if funding > 0.0002:
+                signals["DOWN"] += 1
+                log.info(f"[Ascetix] Funding {funding:.6f} (longs crowded) → DOWN")
+            elif funding < -0.0002:
+                signals["UP"] += 1
+                log.info(f"[Ascetix] Funding {funding:.6f} (shorts crowded) → UP")
+
+        if ob_bias:
+            signals[ob_bias] += 1
+        if liq_bias:
+            signals[liq_bias] += 1
+        if mom_bias:
+            signals[mom_bias] += 1
+
+        log.info(f"[Ascetix] Score: UP={signals['UP']} DOWN={signals['DOWN']}")
+
+        if signals["UP"] >= 3:
+            confidence = (signals["UP"] - 3) / 1.0  # 3/4 = 0.0, 4/4 = 1.0
+            return "UP", round(min(confidence, 1.0), 2)
+        elif signals["DOWN"] >= 3:
+            confidence = (signals["DOWN"] - 3) / 1.0
+            return "DOWN", round(min(confidence, 1.0), 2)
+        return None, 0.0
 
     # ── Market Finder ───────────────────────────────────────────────────
 
@@ -1338,7 +1547,7 @@ class AscetixModeStrategy(Strategy):
         if len(self.positions) >= 1:
             return
 
-        signal = self._compute_signal()
+        signal, confidence = self._compute_signal_with_confidence()
         if not signal:
             log.info("[Ascetix] No confluence — sitting out this window.")
             return
@@ -1371,7 +1580,10 @@ class AscetixModeStrategy(Strategy):
             return
 
         balance = self.client.get_balance()
-        size = round(balance * self.CAPITAL_PCT, 2)
+        # Dynamic Kelly: confidence 0.0 → 25% cap, confidence 1.0 → up to 37.5% (capped at 40%)
+        kelly_multiplier = 1.0 + (0.5 * confidence)  # 1.0x to 1.5x
+        dynamic_pct = min(self.CAPITAL_PCT * kelly_multiplier, 0.40)
+        size = round(balance * dynamic_pct, 2)
         if size < 1.0:
             log.info(f"[Ascetix] Balance too low: ${balance:.2f}")
             return
@@ -1404,8 +1616,8 @@ class AscetixModeStrategy(Strategy):
             self._last_signal_ts = time.time()
             tg(
                 f"⚡ <b>AscetixMode ENTRY</b>\n"
-                f"Signal: {signal} ({result['label']})\n"
-                f"Price: ${price:.4f} | Size: ${size:.2f}\n"
+                f"Signal: {signal} ({result['label']}) | Confidence: {confidence:.0%}\n"
+                f"Kelly: {dynamic_pct:.0%} | Price: ${price:.4f} | Size: ${size:.2f}\n"
                 f"TP: ${self.TP_PRICE} | SL: -{self.SL_DROP_PCT*100:.0f}%\n"
                 f"{market.get('question','')[:55]}"
             )
@@ -1469,6 +1681,16 @@ class ZeusPrimeV2:
         )
         log.info(f"ZeusPrime v2.3 ready. {len(self.strategies)} strategies. Kalshi={'ON' if self.kalshi else 'OFF'}")
 
+        # Start Telegram command listener
+        self._tg_cmd = TelegramCommands(
+            token=cfg.TELEGRAM_TOKEN,
+            chat_id=cfg.TELEGRAM_CHAT,
+            db_ref=db,
+            zeus_ref=self,
+        )
+        self._tg_cmd.start()
+        log.info("[TG-CMD] Telegram command listener started ✅")
+
     def report(self):
         balance = self.client.get_balance()
         pnl = balance - self.start_balance
@@ -1496,6 +1718,7 @@ class ZeusPrimeV2:
                 log.info("Shutdown.")
                 self.client.cancel_all()
                 tg("🔴 <b>ZeusPrime v2.0 stopped.</b>")
+                self._tg_cmd.stop()
                 break
             except Exception as e:
                 log.error(f"Main loop: {e}\n{traceback.format_exc()}")

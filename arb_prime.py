@@ -173,6 +173,25 @@ def calc_net_profit_pct(gross_spread_pct: float, buy_dex: str, sell_dex: str) ->
     return gross_spread_pct - total_cost
 
 
+# ── Stale price detection ─────────────────────────────────────────────────
+# Tracks last N prices per (symbol, dex). Suppresses if identical 2+ times.
+_price_history: dict = {}   # key: (symbol, dex_name) → deque of last 3 prices
+STALE_REPEAT_THRESHOLD = 2  # suppress if same price seen this many times in a row
+
+def is_stale(symbol: str, dex_name: str, price: float) -> bool:
+    """Return True if this price is a stale repeat (identical N times in a row)."""
+    key = (symbol, dex_name)
+    if key not in _price_history:
+        from collections import deque
+        _price_history[key] = deque(maxlen=STALE_REPEAT_THRESHOLD + 1)
+    hist = _price_history[key]
+    hist.append(price)
+    if len(hist) >= STALE_REPEAT_THRESHOLD:
+        if all(p == hist[-1] for p in hist):
+            return True
+    return False
+
+
 # ── Scanner ────────────────────────────────────────────────────────────────
 
 def scan_pair(token_a: str, token_b: str) -> Optional[dict]:
@@ -183,8 +202,11 @@ def scan_pair(token_a: str, token_b: str) -> Optional[dict]:
     for dex_id, dex_name in DEX_LIST:
         p = get_pair_price(dex_id, token_a, token_b)
         if p:
-            prices[dex_name] = p
-            log.info(f"  {dex_name}: ${p:.6f}")
+            if is_stale(symbol, dex_name, p):
+                log.info(f"  {dex_name}: ${p:.6f} [STALE — skipped]")
+            else:
+                prices[dex_name] = p
+                log.info(f"  {dex_name}: ${p:.6f}")
         else:
             log.info(f"  {dex_name}: no data")
 

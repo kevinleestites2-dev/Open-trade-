@@ -78,6 +78,20 @@ DEX_ID_MAP = {
     "QuickSwap V3": 3,
 }
 
+# ── Stale price detection cache ───────────────────────────────────────────
+# Tracks last seen price per (pair, dex). If price unchanged 2 scans in a row → stale.
+_price_cache: dict = {}  # key: (pair, dex) → (price, repeat_count)
+
+def is_stale(pair: str, dex: str, price: float) -> bool:
+    """Returns True if this exact price has been seen before for this pair+dex."""
+    key = (pair, dex)
+    prev_price, count = _price_cache.get(key, (None, 0))
+    if prev_price is not None and abs(price - prev_price) < 1e-8:
+        _price_cache[key] = (price, count + 1)
+        return count + 1 >= 2  # stale after 2 consecutive identical readings
+    _price_cache[key] = (price, 1)
+    return False
+
 # ── V3 fee tiers by DEX+pair (used for contract routing) ──────────────────
 # 3000 = 0.30%  |  500 = 0.05%  |  100 = 0.01%
 V3_FEE_TIER = {
